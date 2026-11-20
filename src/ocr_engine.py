@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from collections import defaultdict
 from ultralytics import YOLO
 from src.config import MODELS_DIR, OCR_MODEL_NAME, VALID_PROVINCE_CODES, setup_logger
 from src.preprocessing import PlatePreprocessor
@@ -8,117 +9,29 @@ logger = setup_logger("OCREngine")
 
 
 class GeometrySorter:
+    """
+    Sắp xếp tọa độ ký tự trên biển số 1 dòng / 2 dòng và áp dụng quy chuẩn biển số Việt Nam:
+    - Tự động loại bỏ nhiễu mép trái trên biển 1 dòng (trị lỗi 129C-640.38 -> 29C-640.38).
+    - Ép chuẩn chữ số ở các vị trí bắt buộc là số (trị lỗi 29C-640.3M -> 29C-640.38).
+    """
 
-    LETTER_TO_DIGIT = {
-        'O': '0', 'D': '0', 'Q': '0', 'U': '0', 'C': '0',
-        'I': '1', 'L': '1', 'T': '1', 'J': '1',
+    LETTER_TO_DIGIT_STRICT = {
+        'O': '0', 'Q': '0', 'D': '0',
+        'I': '1', 'L': '1', 'T': '1',
         'Z': '2',
-        'S': '5', 'F': '5',
+        'A': '4', 'H': '4',
+        'S': '5',
         'G': '6', 'E': '6',
-        'B': '8',
-        'A': '4', 'H': '4', 'M': '4'
+        'B': '8', 'M': '8'
     }
-    DIGIT_TO_LETTER = {
+
+    DIGIT_TO_LETTER_STRICT = {
         '0': 'D',
-        '1': 'A',
         '2': 'Z',
-        '3': 'C',
         '4': 'A',
         '5': 'S',
-        '6': 'C',
-        '7': 'F',
         '8': 'B'
     }
-
-    @staticmethod
-    def _get_binary_char_crop(char_item: dict, plate_img: np.ndarray):
-        if plate_img is None or plate_img.size == 0:
-            return None
-        h_img, w_img = plate_img.shape[:2]
-        x1, y1 = max(0, int(char_item['x1'])), max(0, int(char_item['y1']))
-        x2, y2 = min(w_img, int(char_item['x2'])), min(h_img, int(char_item['y2']))
-
-        crop = plate_img[y1:y2, x1:x2]
-        if crop.shape[0] < 10 or crop.shape[1] < 5:
-            return None
-
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return binary
-
-    @classmethod
-    def verify_c_vs_e(cls, char_item: dict, plate_img: np.ndarray) -> str:
-        label = char_item['label']
-        if label not in ['E', 'G'] or plate_img is None:
-            return label
-
-        binary = cls._get_binary_char_crop(char_item, plate_img)
-        if binary is None:
-            return label
-
-        ch, cw = binary.shape[:2]
-        mid_right = binary[int(ch * 0.36):int(ch * 0.64), int(cw * 0.45):int(cw * 0.90)]
-        top_bar = binary[int(ch * 0.08):int(ch * 0.28), int(cw * 0.30):int(cw * 0.80)]
-        bot_bar = binary[int(ch * 0.72):int(ch * 0.92), int(cw * 0.30):int(cw * 0.80)]
-
-        if mid_right.size > 0 and top_bar.size > 0 and bot_bar.size > 0:
-            white_mid = np.sum(mid_right == 255) / float(mid_right.size)
-            black_top = np.sum(top_bar == 0) / float(top_bar.size)
-            black_bot = np.sum(bot_bar == 0) / float(bot_bar.size)
-
-            if white_mid > 0.52 and (black_top > 0.25 or black_bot > 0.25):
-                return 'C'
-        return label
-
-    @classmethod
-    def verify_x_vs_k(cls, char_item: dict, plate_img: np.ndarray) -> str:
-        label = char_item['label']
-        if label != 'K' or plate_img is None:
-            return label
-
-        binary = cls._get_binary_char_crop(char_item, plate_img)
-        if binary is None:
-            return label
-
-        ch, cw = binary.shape[:2]
-        left_mid_gap = binary[int(ch * 0.35):int(ch * 0.65), int(cw * 0.05):int(cw * 0.35)]
-        center_cross = binary[int(ch * 0.38):int(ch * 0.62), int(cw * 0.35):int(cw * 0.65)]
-
-        if left_mid_gap.size > 0 and center_cross.size > 0:
-            white_left_mid = np.sum(left_mid_gap == 255) / float(left_mid_gap.size)
-            black_center = np.sum(center_cross == 0) / float(center_cross.size)
-
-            if white_left_mid > 0.55 and black_center > 0.40:
-                return 'X'
-        return label
-
-    @classmethod
-    def verify_5_6_8(cls, char_item: dict, plate_img: np.ndarray) -> str:
-        label = char_item['label']
-        if label not in ['5', '6', '8'] or plate_img is None:
-            return label
-
-        binary = cls._get_binary_char_crop(char_item, plate_img)
-        if binary is None:
-            return label
-
-        ch, cw = binary.shape[:2]
-        top_right = binary[int(ch * 0.18):int(ch * 0.42), int(cw * 0.60):int(cw * 0.92)]
-        bot_left = binary[int(ch * 0.55):int(ch * 0.80), int(cw * 0.08):int(cw * 0.40)]
-        top_bar = binary[int(ch * 0.05):int(ch * 0.22), int(cw * 0.25):int(cw * 0.85)]
-
-        if top_right.size > 0 and bot_left.size > 0 and top_bar.size > 0:
-            tr_white = np.sum(top_right == 255) / float(top_right.size)
-            bl_white = np.sum(bot_left == 255) / float(bot_left.size)
-            top_black = np.sum(top_bar == 0) / float(top_bar.size)
-
-            if label == '8' and tr_white > 0.56:
-                return '5' if bl_white > 0.55 else '6'
-
-            if label == '6' and bl_white > 0.54 and top_black > 0.42:
-                return '5'
-
-        return label
 
     @staticmethod
     def filter_boxes_and_border_noise(char_items: list, img_w: int, img_h: int, iou_thresh=0.45) -> list:
@@ -131,11 +44,11 @@ class GeometrySorter:
             cx, cy = item['cx'], item['cy']
             aspect = w / float(h) if h > 0 else 0
 
-            if h < img_h * 0.14 or h > img_h * 0.92:
+            if h < img_h * 0.12 or h > img_h * 0.94:
                 continue
-            if aspect > 1.38 or aspect < 0.07:
+            if aspect > 1.45 or aspect < 0.04:
                 continue
-            if (cx < img_w * 0.02 or cx > img_w * 0.98) and aspect < 0.20:
+            if (cx < img_w * 0.012 or cx > img_w * 0.988) and aspect < 0.10:
                 continue
 
             valid_candidates.append(item)
@@ -146,7 +59,7 @@ class GeometrySorter:
         median_h = float(np.median([x['h'] for x in valid_candidates]))
         size_filtered = [
             x for x in valid_candidates
-            if (0.48 * median_h) <= x['h'] <= (1.62 * median_h)
+            if (0.45 * median_h) <= x['h'] <= (1.68 * median_h)
         ]
         if not size_filtered:
             size_filtered = valid_candidates
@@ -171,7 +84,7 @@ class GeometrySorter:
                 avg_w = (item['w'] + k['w']) / 2.0
                 avg_h = (item['h'] + k['h']) / 2.0
 
-                if (min_area > 0 and (inter_area / min_area) > iou_thresh) or (dist_cx < avg_w * 0.38 and dist_cy < avg_h * 0.42):
+                if (min_area > 0 and (inter_area / min_area) > iou_thresh) or (dist_cx < avg_w * 0.36 and dist_cy < avg_h * 0.42):
                     is_duplicate = True
                     break
             if not is_duplicate:
@@ -185,14 +98,18 @@ class GeometrySorter:
             return False
 
         avg_h = sum([x['h'] for x in items]) / len(items)
-        min_cy = min([x['cy'] for x in items])
-        max_cy = max([x['cy'] for x in items])
-        y_spread = max_cy - min_cy
+        sorted_by_x = sorted(items, key=lambda x: x['cx'])
+        dx = sorted_by_x[-1]['cx'] - sorted_by_x[0]['cx']
+        dy = sorted_by_x[-1]['cy'] - sorted_by_x[0]['cy']
+        slope = float(np.clip(dy / dx, -0.75, 0.75)) if abs(dx) > 20 else 0.0
+        mean_cx = float(np.mean([x['cx'] for x in items]))
+
+        corr_ys = [x['cy'] - slope * (x['cx'] - mean_cx) for x in items]
+        y_spread = max(corr_ys) - min(corr_ys)
 
         if y_spread < 0.60 * avg_h:
             return False
 
-        sorted_by_x = sorted(items, key=lambda x: x['cx'])
         x_overlaps = 0
         for i in range(len(sorted_by_x)):
             for j in range(i + 1, len(sorted_by_x)):
@@ -211,8 +128,10 @@ class GeometrySorter:
         for _ in range(10):
             g1 = [y for y in ys if abs(y - c1) <= abs(y - c2)]
             g2 = [y for y in ys if abs(y - c1) > abs(y - c2)]
-            if g1: c1 = float(np.mean(g1))
-            if g2: c2 = float(np.mean(g2))
+            if g1:
+                c1 = float(np.mean(g1))
+            if g2:
+                c2 = float(np.mean(g2))
 
         top_init = [item for item in items if abs(item['cy'] - c1) <= abs(item['cy'] - c2)]
         bot_init = [item for item in items if abs(item['cy'] - c1) > abs(item['cy'] - c2)]
@@ -224,7 +143,7 @@ class GeometrySorter:
             dx = ref_line[-1]['cx'] - ref_line[0]['cx']
             dy = ref_line[-1]['cy'] - ref_line[0]['cy']
             if abs(dx) > 15:
-                slope = float(np.clip(dy / dx, -0.45, 0.45))
+                slope = float(np.clip(dy / dx, -0.65, 0.65))
 
         mean_cx = float(np.mean([item['cx'] for item in items]))
         corrected_ys = [item['cy'] - slope * (item['cx'] - mean_cx) for item in items]
@@ -238,25 +157,35 @@ class GeometrySorter:
         return top_line, bottom_line
 
     @classmethod
-    def _apply_vn_rules(cls, top_items: list, bottom_items: list, is_two_lines: bool, plate_img: np.ndarray = None):
+    def _clean_one_line_leading_noise(cls, items: list) -> list:
+        """
+        Trên biển 1 dòng Việt Nam, vị trí 0-1 là 2 chữ số mã tỉnh, vị trí 2 là chữ cái series.
+        Nếu phát hiện 9 ký tự mà 3 ký tự đầu đều là số và ký tự thứ 4 là chữ cái (VD: 129C64038),
+        thì ký tự đầu tiên ('1') là vệt bóng/khung viền mép trái -> Loại bỏ để trả về 29C-640.38!
+        """
+        if len(items) == 9:
+            c0, c1, c2, c3 = items[0]['label'], items[1]['label'], items[2]['label'], items[3]['label']
+            if c0.isdigit() and c1.isdigit() and c2.isdigit() and c3.isalpha():
+                return items[1:]
+        return items
+
+    @classmethod
+    def _apply_vn_rules(cls, top_items: list, bottom_items: list, is_two_lines: bool):
         if is_two_lines:
             for i, item in enumerate(top_items):
                 c = item['label']
                 if i in [0, 1]:
-                    c = cls.LETTER_TO_DIGIT.get(c, c)
-                    item['label'] = cls.verify_5_6_8({**item, 'label': c}, plate_img)
+                    item['label'] = cls.LETTER_TO_DIGIT_STRICT.get(c, c)
                 elif i == 2:
-                    c_fixed = cls.DIGIT_TO_LETTER.get(c, c)
-                    c_fixed = cls.verify_c_vs_e({**item, 'label': c_fixed}, plate_img)
-                    c_fixed = cls.verify_x_vs_k({**item, 'label': c_fixed}, plate_img)
-                    item['label'] = c_fixed
+                    if c.isdigit():
+                        item['label'] = cls.DIGIT_TO_LETTER_STRICT.get(c, c)
                 elif i == 3:
-                    if c in ['O', 'Q', 'I', 'L', 'Z', 'S', 'B', 'G']:
-                        item['label'] = cls.LETTER_TO_DIGIT.get(c, c)
+                    if c in ['O', 'Q', 'I', 'L']:
+                        item['label'] = cls.LETTER_TO_DIGIT_STRICT.get(c, c)
 
             for item in bottom_items:
-                c = cls.LETTER_TO_DIGIT.get(item['label'], item['label'])
-                item['label'] = cls.verify_5_6_8({**item, 'label': c}, plate_img)
+                c = item['label']
+                item['label'] = cls.LETTER_TO_DIGIT_STRICT.get(c, c)
 
             return "".join([x['label'] for x in top_items]), "".join([x['label'] for x in bottom_items])
         else:
@@ -264,31 +193,48 @@ class GeometrySorter:
             for i, item in enumerate(top_items):
                 c = item['label']
                 if i in [0, 1]:
-                    c = cls.LETTER_TO_DIGIT.get(c, c)
-                    item['label'] = cls.verify_5_6_8({**item, 'label': c}, plate_img)
+                    item['label'] = cls.LETTER_TO_DIGIT_STRICT.get(c, c)
                 elif i == 2:
-                    c_fixed = cls.DIGIT_TO_LETTER.get(c, c)
-                    c_fixed = cls.verify_c_vs_e({**item, 'label': c_fixed}, plate_img)
-                    c_fixed = cls.verify_x_vs_k({**item, 'label': c_fixed}, plate_img)
-                    item['label'] = c_fixed
-                elif i == 3:
-                    if total_len <= 8:
-                        c = cls.LETTER_TO_DIGIT.get(c, c)
-                        item['label'] = cls.verify_5_6_8({**item, 'label': c}, plate_img)
+                    if c.isdigit():
+                        item['label'] = cls.DIGIT_TO_LETTER_STRICT.get(c, c)
+                elif i == 3 and total_len <= 8:
+                    item['label'] = cls.LETTER_TO_DIGIT_STRICT.get(c, c)
                 elif i >= 4:
-                    c = cls.LETTER_TO_DIGIT.get(c, c)
-                    item['label'] = cls.verify_5_6_8({**item, 'label': c}, plate_img)
+                    item['label'] = cls.LETTER_TO_DIGIT_STRICT.get(c, c)
 
             return "".join([x['label'] for x in top_items]), ""
 
     @classmethod
-    def sort_and_format(cls, char_items, img_w, img_h, plate_img=None):
+    def format_from_lines(cls, top_line: list, bottom_line: list, is_two_lines: bool) -> str:
+        if not is_two_lines:
+            clean_top = "".join([x['label'] for x in top_line])
+            if len(clean_top) >= 7:
+                province = clean_top[:2]
+                remainder = clean_top[2:]
+                num_len = 5 if len(clean_top) >= 8 else 4
+                series = remainder[:-num_len]
+                num_seq = remainder[-num_len:]
+                num_fmt = f"{num_seq[:3]}.{num_seq[3:]}" if len(num_seq) == 5 else num_seq
+                return f"{province}{series}-{num_fmt}"
+            return clean_top
+        else:
+            clean_top = "".join([x['label'] for x in top_line])
+            clean_bot = "".join([x['label'] for x in bottom_line])
+            bot_fmt = f"{clean_bot[:3]}.{clean_bot[3:]}" if len(clean_bot) == 5 else clean_bot
+            if len(clean_top) == 4:
+                return f"{clean_top[:2]}-{clean_top[2:]} {bot_fmt}"
+            elif len(clean_top) == 3:
+                return f"{clean_top} {bot_fmt}"
+            return f"{clean_top} {bot_fmt}".strip()
+
+    @classmethod
+    def sort_and_format(cls, char_items, img_w, img_h):
         if not char_items:
-            return "", [], 0, 0
+            return "", [], [], [], False
 
         filtered = cls.filter_boxes_and_border_noise(char_items, img_w, img_h)
         if not filtered:
-            return "", [], 0, 0
+            return "", [], [], [], False
 
         is_two_lines = cls.is_really_two_lines(filtered)
 
@@ -298,16 +244,10 @@ class GeometrySorter:
                 filtered = sorted(filtered, key=lambda x: x['conf'], reverse=True)[:9]
                 filtered.sort(key=lambda x: x['cx'])
 
-            clean_top, _ = cls._apply_vn_rules(filtered, [], is_two_lines=False, plate_img=plate_img)
-            if len(clean_top) >= 7:
-                province = clean_top[:2]
-                remainder = clean_top[2:]
-                num_len = 5 if len(clean_top) >= 8 else 4
-                series = remainder[:-num_len]
-                num_seq = remainder[-num_len:]
-                num_fmt = f"{num_seq[:3]}.{num_seq[3:]}" if len(num_seq) == 5 else num_seq
-                return f"{province}{series}-{num_fmt}", filtered, len(filtered), 0
-            return clean_top, filtered, len(filtered), 0
+            filtered = cls._clean_one_line_leading_noise(filtered)
+            cls._apply_vn_rules(filtered, [], is_two_lines=False)
+            formatted = cls.format_from_lines(filtered, [], is_two_lines=False)
+            return formatted, filtered, filtered, [], False
         else:
             top_line, bottom_line = cls.split_two_lines_sloped(filtered)
             if len(top_line) > 4:
@@ -317,32 +257,32 @@ class GeometrySorter:
                 bottom_line = sorted(bottom_line, key=lambda x: x['conf'], reverse=True)[:5]
                 bottom_line.sort(key=lambda x: x['cx'])
 
-            clean_top, clean_bot = cls._apply_vn_rules(top_line, bottom_line, is_two_lines=True, plate_img=plate_img)
-            bot_fmt = f"{clean_bot[:3]}.{clean_bot[3:]}" if len(clean_bot) == 5 else clean_bot
-
-            if len(clean_top) == 4:
-                return f"{clean_top[:2]}-{clean_top[2:]} {bot_fmt}", top_line + bottom_line, len(top_line), len(bottom_line)
-            elif len(clean_top) == 3:
-                return f"{clean_top} {bot_fmt}", top_line + bottom_line, len(top_line), len(bottom_line)
-            return f"{clean_top} {bot_fmt}".strip(), top_line + bottom_line, len(top_line), len(bottom_line)
+            cls._apply_vn_rules(top_line, bottom_line, is_two_lines=True)
+            formatted = cls.format_from_lines(top_line, bottom_line, is_two_lines=True)
+            return formatted, top_line + bottom_line, top_line, bottom_line, True
 
 
 class OCREngine:
+    """
+    STAGE 2 - BỘ GIẢI MÃ KÝ TỰ SIÊU TỐC (EARLY-EXIT CASCADE + BATCH INFERENCE):
+    - Tầng 1 (Fast Tier): Quét batch 2 biến thể chuẩn. Thoát sớm khi đủ 8-9 ký tự, đúng mã tỉnh, conf >= 83%.
+    - Tầng 2 (Deep Tier): Quét batch NightBoost, AntiGlare, PerspectiveRectified, Deshear ở imgsz=512, conf=0.06.
+    - Tầng 3 (Rotation Tier): Tự động thử xoay 180° / 90° khi chiều thẳng đọc kém.
+    """
+
     def __init__(self):
-        logger.info("=== NẠP LÕI YOLO OCR (CHUYÊN TRỊ BIỂN VÀNG, MỜ, XA, NGHIÊNG PRO) ===")
+        logger.info("=== NẠP LÕI YOLO OCR (EARLY-EXIT CASCADE + BATCH INFERENCE) ===")
         ocr_model_path = MODELS_DIR / OCR_MODEL_NAME
         self.model = YOLO(str(ocr_model_path)) if ocr_model_path.exists() else None
         self.class_names = self.model.names if self.model else []
         self.sorter = GeometrySorter()
         self.preprocessor = PlatePreprocessor()
 
-    def _run_single_pass(self, variant_name: str, img_variant: np.ndarray, imgsz: int = 416):
+    def _score_yolo_result(self, variant_name: str, img_variant: np.ndarray, yolo_res, imgsz: int) -> dict:
         img_h, img_w = img_variant.shape[:2]
-        results = self.model(img_variant, imgsz=imgsz, verbose=False, conf=0.09, iou=0.45)
-
         raw_items = []
-        for r in results:
-            for box in r.boxes:
+        if yolo_res is not None and yolo_res.boxes is not None:
+            for box in yolo_res.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 cls_id = int(box.cls[0].cpu().numpy())
                 conf = float(box.conf[0].cpu().numpy())
@@ -355,75 +295,175 @@ class OCREngine:
                     'conf': conf, 'label': label
                 })
 
-        plate_text, valid_items, top_cnt, bot_cnt = self.sorter.sort_and_format(
-            raw_items, img_w, img_h, plate_img=img_variant
+        plate_text, valid_items, top_line, bottom_line, is_two_lines = self.sorter.sort_and_format(
+            raw_items, img_w, img_h
         )
         avg_conf = (sum([x['conf'] for x in valid_items]) / len(valid_items) * 100.0) if valid_items else 0.0
         sum_conf = sum([x['conf'] for x in valid_items]) * 100.0
 
         char_count = len(valid_items)
-        score = avg_conf * 1.5 + sum_conf * 0.45
+        top_cnt = len(top_line)
+        bot_cnt = len(bottom_line)
+        score = avg_conf * 2.0 + sum_conf * 0.45
 
-        if bot_cnt > 0:
-            if top_cnt in [3, 4] and bot_cnt == 5:
-                score += 560.0
+        if is_two_lines:
+            if top_cnt == 4 and bot_cnt == 5:
+                score += 600.0
+            elif top_cnt == 3 and bot_cnt == 5:
+                score += 540.0
             elif top_cnt in [3, 4] and bot_cnt == 4:
-                score += 390.0
+                score += 480.0
+            elif top_cnt > bot_cnt:
+                score -= 350.0
             else:
                 score -= 200.0
         else:
             if char_count in [8, 9]:
-                score += 520.0
+                score += 540.0
             elif char_count == 7:
-                score += 350.0
+                score += 380.0
             else:
                 score -= 250.0
 
         clean_alnum = "".join([c for c in plate_text if c.isalnum()])
+        has_valid_prov = (len(clean_alnum) >= 2 and (clean_alnum[:2] in VALID_PROVINCE_CODES or clean_alnum[:2] == "80"))
         if len(clean_alnum) >= 2:
-            if clean_alnum[:2] in VALID_PROVINCE_CODES or clean_alnum[:2] == "80":
-                score += 180.0
-            else:
-                score -= 220.0
+            score += 200.0 if has_valid_prov else -260.0
 
         if len(clean_alnum) >= 3 and clean_alnum[2].isalpha():
-            score += 80.0
+            score += 85.0
 
-        if "YellowToWhite_Priority" in variant_name:
-            score += 45.0
-        elif "Natural" in variant_name or "RedGreenClean" in variant_name:
-            score += 20.0
+        if any(k in variant_name for k in ["NaturalSharp", "YellowToWhite_Priority", "CleanCLAHE", "NightBoost", "AntiGlare"]):
+            score += 30.0
 
         return {
             'score': score,
             'text': plate_text,
             'items': valid_items,
+            'top_line': top_line,
+            'bottom_line': bottom_line,
+            'is_two_lines': is_two_lines,
             'avg_conf': avg_conf,
             'img': img_variant,
+            'char_count': char_count,
+            'top_cnt': top_cnt,
+            'has_valid_prov': has_valid_prov,
             'name': f"{variant_name}_{imgsz}"
         }
 
-    def extract_text(self, image: np.ndarray) -> tuple:
+    def _run_batch_passes(self, named_variants: list, prefix: str, imgsz: int = 416, conf_thresh: float = 0.10) -> list:
+        if not named_variants:
+            return []
+        imgs = [v_img for _, v_img in named_variants]
+        results = self.model(imgs, imgsz=imgsz, verbose=False, conf=conf_thresh, iou=0.45)
+
+        out = []
+        for (v_name, v_img), res in zip(named_variants, results):
+            out.append(self._score_yolo_result(f"{prefix}_{v_name}", v_img, res, imgsz))
+        return out
+
+    def _apply_selective_consensus(self, pass_results: list) -> dict:
+        best_res = max(pass_results, key=lambda x: x['score'])
+        if not best_res['items']:
+            return best_res
+
+        if best_res['avg_conf'] >= 82.0 and best_res['char_count'] >= 8:
+            return best_res
+
+        target_is_2l = best_res['is_two_lines']
+        target_top_len = len(best_res['top_line'])
+        target_bot_len = len(best_res['bottom_line'])
+        target_prefix = best_res['name'].split('_')[0]
+
+        strong_peers = [
+            p for p in pass_results
+            if p['name'].startswith(target_prefix)
+            and p['is_two_lines'] == target_is_2l
+            and len(p['top_line']) == target_top_len
+            and len(p['bottom_line']) == target_bot_len
+            and p['avg_conf'] >= 55.0
+            and "Deshear" not in p['name']
+        ]
+
+        if len(strong_peers) < 3:
+            return best_res
+
+        voted_top = [dict(x) for x in best_res['top_line']]
+        for idx in range(target_top_len):
+            votes = defaultdict(float)
+            for p in strong_peers:
+                ch_item = p['top_line'][idx]
+                votes[ch_item['label']] += (ch_item['conf'] ** 2)
+            voted_top[idx]['label'] = max(votes.items(), key=lambda kv: kv[1])[0]
+
+        voted_bottom = [dict(x) for x in best_res['bottom_line']]
+        for idx in range(target_bot_len):
+            votes = defaultdict(float)
+            for p in strong_peers:
+                ch_item = p['bottom_line'][idx]
+                votes[ch_item['label']] += (ch_item['conf'] ** 2)
+            voted_bottom[idx]['label'] = max(votes.items(), key=lambda kv: kv[1])[0]
+
+        voted_text = self.sorter.format_from_lines(voted_top, voted_bottom, target_is_2l)
+        clean_voted = "".join([c for c in voted_text if c.isalnum()])
+        if len(clean_voted) >= 7 and (clean_voted[:2] in VALID_PROVINCE_CODES or clean_voted[:2] == "80"):
+            best_res['text'] = voted_text
+            best_res['top_line'] = voted_top
+            best_res['bottom_line'] = voted_bottom
+            best_res['items'] = voted_top + voted_bottom
+
+        return best_res
+
+    def _draw_debug_boxes(self, final_res: dict) -> np.ndarray:
+        debug_img = final_res['img'].copy()
+        for item in final_res['items']:
+            x1, y1, x2, y2 = int(item['x1']), int(item['y1']), int(item['x2']), int(item['y2'])
+            cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                debug_img, item['label'], (x1 + 2, max(18, y1 - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 0, 255), 2, cv2.LINE_AA
+            )
+        return debug_img
+
+    def extract_text(self, image: np.ndarray, orient: str = "ROT0") -> tuple:
         if image is None or image.size == 0 or self.model is None:
             return "", image, 0.0
 
-        variants = self.preprocessor.generate_variants(image)
-        pass_results = []
+        aligned, img_up, plate_type = self.preprocessor.prepare_base_image(image, orient=orient)
 
-        for v_name, v_img in variants:
-            pass_results.append(self._run_single_pass(v_name, v_img, imgsz=320))
-            pass_results.append(self._run_single_pass(v_name, v_img, imgsz=480))
+        # TẦNG 1: SIÊU TỐC (EARLY-EXIT)
+        fast_variants = self.preprocessor.generate_fast_variants(img_up, plate_type)
+        pass_results = self._run_batch_passes(fast_variants, prefix="MAIN", imgsz=416, conf_thresh=0.10)
+        best_fast = max(pass_results, key=lambda x: x['score'])
 
-        best_res = max(pass_results, key=lambda x: x['score'])
+        # Chỉ thoát sớm khi rất chắc chắn (>= 83% và không bị thiếu ký tự dòng trên do lóa)
+        is_complete_fast = (best_fast['char_count'] >= 9) or (not best_fast['is_two_lines'] and best_fast['char_count'] >= 8)
+        if is_complete_fast and best_fast['has_valid_prov'] and best_fast['avg_conf'] >= 83.0:
+            return best_fast['text'], self._draw_debug_boxes(best_fast), best_fast['avg_conf']
 
-        debug_img = best_res['img'].copy()
-        for item in best_res['items']:
-            x1, y1, x2, y2 = int(item['x1']), int(item['y1']), int(item['x2']), int(item['y2'])
-            char_label = item['label']
-            cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                debug_img, char_label, (x1 + 2, max(18, y1 - 4)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 0, 255), 2, cv2.LINE_AA
-            )
+        # TẦNG 2: CHUYÊN SÂU (NightBoost, AntiGlare, Homography, Deshear ở imgsz=512, conf=0.06)
+        deep_variants = self.preprocessor.generate_deep_variants(aligned, img_up, plate_type)
+        if deep_variants:
+            pass_results.extend(self._run_batch_passes(deep_variants, prefix="MAIN", imgsz=512, conf_thresh=0.06))
 
-        return best_res['text'], debug_img, best_res['avg_conf']
+        best_main = max(pass_results, key=lambda x: x['score'])
+        if best_main['char_count'] >= 7 and best_main['has_valid_prov'] and best_main['avg_conf'] >= 72.0:
+            final_res = self._apply_selective_consensus(pass_results)
+            return final_res['text'], self._draw_debug_boxes(final_res), final_res['avg_conf']
+
+        # TẦNG 3: TỰ ĐỘNG XOAY 180° / 90° (Chỉ chạy khi chiều thẳng thực sự đọc kém)
+        fallback_orients = []
+        if orient == "ROT0":
+            fallback_orients.append("ROT180")
+            if best_main['char_count'] < 6 or not best_main['has_valid_prov']:
+                fallback_orients.extend(["ROT90_CW", "ROT90_CCW"])
+        else:
+            fallback_orients.append("ROT0")
+
+        for fb_orient in fallback_orients:
+            _, fb_up, fb_type = self.preprocessor.prepare_base_image(image, orient=fb_orient)
+            fb_fast = self.preprocessor.generate_fast_variants(fb_up, fb_type)
+            pass_results.extend(self._run_batch_passes(fb_fast, prefix=f"FB_{fb_orient}", imgsz=416, conf_thresh=0.10))
+
+        final_res = self._apply_selective_consensus(pass_results)
+        return final_res['text'], self._draw_debug_boxes(final_res), final_res['avg_conf']
