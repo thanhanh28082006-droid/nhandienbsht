@@ -328,13 +328,10 @@ class PlatePreprocessor:
         if plate_type != 'YELLOW':
             variants.append(("V3_RedGreenClean", cls.extract_red_green_clean_plate(img_up)))
 
-        # Nâng sáng vùng tối sâu ban đêm (trị 30E-755.31)
         variants.append(("V4_NightBoost", cls.apply_gamma(v_clahe, gamma=1.90)))
 
-        # Giảm chói lóa đèn flash / nắng gắt (trị 59-X1 120.70 và 29C-640.38)
         variants.append(("V5_AntiGlare", cls.apply_gamma(v_clahe, gamma=0.58)))
 
-        # Ép phẳng phối cảnh 4 góc Homography
         rectified = cls.perspective_rectify(aligned)
         if rectified is not None and rectified.size > 0:
             rh, rw = rectified.shape[:2]
@@ -345,7 +342,6 @@ class PlatePreprocessor:
             r_up = cv2.resize(r_pad, (img_up.shape[1], img_up.shape[0]), interpolation=cv2.INTER_CUBIC)
             variants.append(("V6_PerspectiveRectified", r_up))
 
-        # Trượt góc nắn xiên 2 chiều
         variants.append(("V7_DeshearPos", cls.apply_affine_transform(v_clahe, shear_x=0.14, angle=-2.0)))
         variants.append(("V8_DeshearNeg", cls.apply_affine_transform(v_clahe, shear_x=-0.14, angle=2.0)))
 
