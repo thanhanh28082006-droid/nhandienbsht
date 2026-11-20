@@ -431,12 +431,12 @@ class OCREngine:
 
         aligned, img_up, plate_type = self.preprocessor.prepare_base_image(image, orient=orient)
 
-        # TẦNG 1: SIÊU TỐC (EARLY-EXIT)
+        # TẦNG 1: 
         fast_variants = self.preprocessor.generate_fast_variants(img_up, plate_type)
         pass_results = self._run_batch_passes(fast_variants, prefix="MAIN", imgsz=416, conf_thresh=0.10)
         best_fast = max(pass_results, key=lambda x: x['score'])
 
-        # Chỉ thoát sớm khi rất chắc chắn (>= 83% và không bị thiếu ký tự dòng trên do lóa)
+        
         is_complete_fast = (best_fast['char_count'] >= 9) or (not best_fast['is_two_lines'] and best_fast['char_count'] >= 8)
         if is_complete_fast and best_fast['has_valid_prov'] and best_fast['avg_conf'] >= 83.0:
             return best_fast['text'], self._draw_debug_boxes(best_fast), best_fast['avg_conf']
