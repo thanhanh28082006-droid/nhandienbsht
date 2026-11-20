@@ -72,8 +72,6 @@ class YOLODetector:
                 continue
 
             aspect = bw / float(bh)
-            # Cho phép cả biển ngang (0.65..4.6) và biển xoay dọc 90°/270° (0.20..1.65)
-            # Cho phép từ 0.45 để bắt trọn biển xe máy chụp chéo/sát mép (như 59-X1 475.44)
             is_valid_ratio = (0.45 <= aspect <= 4.6) if orient == "ROT0" else (0.20 <= aspect <= 4.6)
             is_valid_size = (bw <= img_w * 0.88) and (bh <= img_h * 0.88)
 
@@ -133,7 +131,6 @@ class YOLODetector:
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
             eq = clahe.apply(gray)
 
-            # Toán tử hình thái học Black-Hat tìm chữ đen trên nền sáng (kể cả vùng lóa)
             rect_kern = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 5))
             blackhat = cv2.morphologyEx(eq, cv2.MORPH_BLACKHAT, rect_kern)
 
@@ -161,7 +158,6 @@ class YOLODetector:
                 if bw < 45 or bh < 16:
                     continue
                 aspect = bw / float(bh)
-                # Biển số 1 dòng hoặc 2 dòng nằm ngang
                 if 0.85 <= aspect <= 4.6:
                     pad_x = int(bw * 0.14)
                     pad_y = int(bh * 0.22)
@@ -182,7 +178,6 @@ class YOLODetector:
         h, w = original_img.shape[:2]
         raw_boxes = []
 
-        # Tầng 1: Quét trên ảnh gốc (0°) với độ phân giải 640 và 800
         for sz in (640, 800):
             hits = self._run_yolo_pass(original_img, self.conf_threshold, imgsz=sz)
             for rx1, ry1, rx2, ry2, c in hits:
@@ -191,7 +186,6 @@ class YOLODetector:
             if raw_boxes:
                 break
 
-        # Tầng 2: Quét ảnh tăng cường sáng/giảm lóa và quét phóng đại vùng nửa dưới ảnh (trị biển sát mép)
         if not raw_boxes:
             enh_variants = [
                 self._enhance_clahe_lab(original_img, clip_limit=2.8, grid=8),
@@ -207,7 +201,6 @@ class YOLODetector:
                     break
 
         if not raw_boxes and h > 120:
-            # Quét riêng 60% nửa dưới khung hình (trị biển nằm sát cạnh đáy như 29C-640.38)
             y_offset = int(h * 0.40)
             bottom_roi = original_img[y_offset:h, 0:w]
             bottom_enh = self._enhance_clahe_lab(bottom_roi, clip_limit=3.0, grid=8)
@@ -219,7 +212,6 @@ class YOLODetector:
                     c, "ROT0"
                 ])
 
-        # Tầng 3: Quét chủ động các hướng xoay 90° CW, 90° CCW, 180° (trị ảnh chụp dọc như 77-L1 600.30)
         if not raw_boxes:
             rot_configs = [
                 ("ROT90_CW", cv2.rotate(original_img, cv2.ROTATE_90_CLOCKWISE)),
@@ -237,7 +229,6 @@ class YOLODetector:
                 if raw_boxes:
                     break
 
-        # Tầng 4: Đề xuất vùng ứng viên tương phản Black-Hat khi YOLO vẫn chưa bắt được
         if not raw_boxes:
             raw_boxes.extend(self._propose_contrast_plate_candidates(original_img))
 
