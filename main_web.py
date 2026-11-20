@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from nicegui import ui, run, native
 
-from src.config import MODELS_DIR, BASE_DIR, setup_logger, get_province_name
+from src.config import MODELS_DIR, BASE_DIR, VALID_PROVINCE_CODES, setup_logger, get_province_name
 from src.detector import YOLODetector
 from src.ocr_engine import OCREngine
 
@@ -25,7 +25,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 class ALPRWebSystem:
     def __init__(self):
         detector_path = MODELS_DIR / "yolo_detector.pt"
-        self.detector = YOLODetector(model_path=str(detector_path), conf_threshold=0.40)
+        self.detector = YOLODetector(model_path=str(detector_path), conf_threshold=0.28)
         self.ocr = OCREngine()
         self.db_params = {
             "host": "localhost",
@@ -39,10 +39,11 @@ class ALPRWebSystem:
         self.last_raw_image = None
         self.last_annotated_image = None
 
+        # Điều khiển Video & Thanh thời gian (Timeline + Speed Control)
         self.is_video_mode = False
         self.video_running = False
         self.video_paused = False
-        self.playback_speed = 0.20
+        self.playback_speed = 0.60
         self.video_total_frames = 0
         self.video_current_frame = 0
         self.video_native_fps = 25.0
@@ -53,15 +54,37 @@ class ALPRWebSystem:
         self.detector_lock = threading.Lock()
         self.ocr_lock = threading.Lock()
 
+        # Đồng bộ hình ảnh & dữ liệu với giao diện qua Timer
         self.latest_frame_b64 = ""
         self.frame_updated = False
         self.ui_needs_refresh = False
+
+    @staticmethod
+    def is_valid_vn_plate(plate_text: str, avg_conf: float) -> bool:
+        """
+        Chốt chặn kiểm định trước khi truy vấn CSDL / báo phạt:
+        Biển số phải đủ 7-9 ký tự, đúng cấu trúc biển số Việt Nam và độ tin cậy OCR >= 50%.
+        """
+        if not plate_text or avg_conf < 50.0:
+            return False
+        clean = "".join(c for c in plate_text if c.isalnum())
+        if len(clean) < 7 or len(clean) > 9:
+            return False
+        if not clean[:2].isdigit():
+            return False
+        if clean[:2] not in VALID_PROVINCE_CODES and clean[:2] != "80":
+            return False
+        if not clean[2].isalpha():
+            return False
+        if not clean[-4:].isdigit():
+            return False
+        return True
 
     @property
     def stats(self):
         total = len(self.history_logs)
         valid = sum(1 for item in self.history_logs if item["status"] == "HOP LE")
-        violation = total - valid
+        violation = sum(1 for item in self.history_logs if item["status"] not in ("HOP LE", "KHONG RO"))
         conf_sum = sum(item["conf_val"] for item in self.history_logs)
         return {
             "total": total,
@@ -72,7 +95,7 @@ class ALPRWebSystem:
 
     def query_database(self, plate_text):
         if not plate_text:
-            return {"owner": "---", "reg_date": "---", "status": "---"}
+            return {"owner": "---", "reg_date": "---", "status": "KHONG RO"}
         clean_plate = "".join(filter(str.isalnum, plate_text))
         try:
             conn = psycopg2.connect(**self.db_params)
@@ -105,7 +128,7 @@ class ALPRWebSystem:
 
     def update_vehicle_in_db(self, plate_text: str, new_status: str, new_owner: str = None) -> bool:
         clean_plate = "".join(filter(str.isalnum, plate_text))
-        if not clean_plate:
+        if not clean_plate or plate_text == "KHONG DOC RO":
             return False
         try:
             conn = psycopg2.connect(**self.db_params)
@@ -148,14 +171,23 @@ class ALPRWebSystem:
         return True
 
     @staticmethod
-    def draw_plate_box_and_banner(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, plate_text: str, det_conf: int,
-                                  is_red_style: bool = True):
-        if is_red_style:
-            box_color = (35, 35, 245)
-            txt_color = (255, 255, 255)
-        else:
+    def draw_plate_box_and_banner(img: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+                                  plate_text: str, det_conf: int, box_mode: str = "RED"):
+        """
+        Vẽ khung biển số và nhãn hiển thị:
+        - 'RED': Khung đỏ nổi bật (cảnh báo / video).
+        - 'GREEN': Khung xanh lá (hợp lệ).
+        - 'GRAY': Khung xám trung tính (không đọc rõ, không báo phạt).
+        """
+        if box_mode == "GRAY":
+            box_color = (160, 170, 180)
+            txt_color = (15, 20, 30)
+        elif box_mode == "GREEN":
             box_color = (0, 230, 118)
             txt_color = (10, 15, 25)
+        else:
+            box_color = (35, 35, 245)
+            txt_color = (255, 255, 255)
 
         cv2.rectangle(img, (x1, y1), (x2, y2), box_color, 3)
 
@@ -182,9 +214,19 @@ class ALPRWebSystem:
         img = self.last_raw_image.copy()
         for res in self.current_results:
             x1, y1, x2, y2 = res["bbox"]
-            is_alert = res["db"]["status"] != "HOP LE"
+            st = res["db"]["status"]
+            if st == "KHONG RO":
+                mode = "GRAY"
+                lbl_plate = "KHONG DOC RO"
+            elif st == "HOP LE":
+                mode = "GREEN"
+                lbl_plate = res["plate"]
+            else:
+                mode = "RED"
+                lbl_plate = res["plate"]
+
             self.draw_plate_box_and_banner(
-                img, x1, y1, x2, y2, res["plate"], res["det_conf"], is_red_style=is_alert
+                img, x1, y1, x2, y2, lbl_plate, res["det_conf"], box_mode=mode
             )
 
         self.last_annotated_image = img
@@ -209,14 +251,16 @@ class ALPRWebSystem:
                 if len(box) < 4:
                     continue
                 x1, y1, x2, y2 = map(int, box[:4])
+                box_orient = box[5] if len(box) >= 6 else "ROT0"
                 if (y2 - y1) == 0:
                     continue
                 aspect_ratio = (x2 - x1) / float(y2 - y1)
-                if aspect_ratio < 0.8 or aspect_ratio > 3.8 or (x2 - x1) > (w_img * 0.45):
+                valid_aspect = (0.45 <= aspect_ratio <= 4.5) if box_orient == "ROT0" else (0.20 <= aspect_ratio <= 4.5)
+                if not valid_aspect or (x2 - x1) > (w_img * 0.75):
                     continue
 
-                pad_x = int((x2 - x1) * 0.06)
-                pad_y = int((y2 - y1) * 0.06)
+                pad_x = int((x2 - x1) * 0.08)
+                pad_y = int((y2 - y1) * 0.08)
                 cropped_plate = original_img[
                     max(0, y1 - pad_y):min(h_img, y2 + pad_y),
                     max(0, x1 - pad_x):min(w_img, x2 + pad_x)
@@ -225,28 +269,17 @@ class ALPRWebSystem:
                     continue
 
                 with self.ocr_lock:
-                    bien_so_text, traced_img, avg_conf = self.ocr.extract_text(cropped_plate)
+                    bien_so_text, traced_img, avg_conf = self.ocr.extract_text(cropped_plate, orient=box_orient)
+
                 plate_det_conf = int(box[4] * 100) if len(box) >= 5 else 0
-                db_info = self.query_database(bien_so_text)
-                province_name = get_province_name(bien_so_text)
                 now_str = datetime.now().strftime("%H:%M:%S")
                 full_time_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
 
-                item_data = {
-                    "id": idx + 1,
-                    "plate": bien_so_text if bien_so_text else "KHONG DOC DUOC",
-                    "conf": avg_conf,
-                    "det_conf": plate_det_conf,
-                    "province": province_name,
-                    "xray": traced_img,
-                    "crop_orig": cropped_plate,
-                    "db": db_info,
-                    "bbox": (x1, y1, x2, y2),
-                    "timestamp": full_time_str
-                }
-                results_data.append(item_data)
+                if self.is_valid_vn_plate(bien_so_text, avg_conf):
+                    db_info = self.query_database(bien_so_text)
+                    province_name = get_province_name(bien_so_text)
+                    display_plate = bien_so_text
 
-                if bien_so_text:
                     self.history_logs.insert(0, {
                         "uid": f"{now_str}_{bien_so_text}_{random.randint(10, 99)}",
                         "time": now_str,
@@ -261,6 +294,24 @@ class ALPRWebSystem:
                         "xray": traced_img
                     })
                     self.history_logs = self.history_logs[:50]
+                else:
+                    db_info = {"owner": "---", "reg_date": "---", "status": "KHONG RO"}
+                    province_name = "---"
+                    display_plate = "KHONG DOC RO"
+
+                item_data = {
+                    "id": idx + 1,
+                    "plate": display_plate,
+                    "conf": avg_conf,
+                    "det_conf": plate_det_conf,
+                    "province": province_name,
+                    "xray": traced_img,
+                    "crop_orig": cropped_plate,
+                    "db": db_info,
+                    "bbox": (x1, y1, x2, y2),
+                    "timestamp": full_time_str
+                }
+                results_data.append(item_data)
 
         self.current_results = results_data
         final_img = self.redraw_annotated_image()
@@ -278,7 +329,7 @@ class ALPRWebSystem:
 
         if run_yolo:
             with self.detector_lock:
-                results = self.detector.model(frame, imgsz=512, conf=0.38, iou=0.45, verbose=False)
+                results = self.detector.model(frame, imgsz=512, conf=0.35, iou=0.45, verbose=False)
 
             if results and len(results) > 0 and results[0].boxes is not None:
                 boxes = results[0].boxes
@@ -288,10 +339,10 @@ class ALPRWebSystem:
                 for i, box in enumerate(xyxys):
                     x1, y1, x2, y2 = map(int, box[:4])
                     bw, bh = x2 - x1, y2 - y1
-                    if bh <= 14 or bw <= 22:
+                    if bh <= 14 or bw <= 20:
                         continue
                     aspect = bw / float(bh)
-                    if aspect < 0.72 or aspect > 4.2 or bw > (w_img * 0.45):
+                    if aspect < 0.45 or aspect > 4.5 or bw > (w_img * 0.50):
                         continue
 
                     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -315,7 +366,7 @@ class ALPRWebSystem:
                             "plate": "",
                             "conf": 0.0,
                             "det_conf": det_conf,
-                            "db": {"owner": "---", "reg_date": "---", "status": "HOP LE"}
+                            "db": {"owner": "---", "reg_date": "---", "status": "KHONG RO"}
                         }
                     else:
                         self.tracked_vehicles[matched_key]["cx"] = cx
@@ -351,7 +402,7 @@ class ALPRWebSystem:
                 x1, y1, x2, y2,
                 plate_text=t_info["plate"],
                 det_conf=t_info["det_conf"],
-                is_red_style=True  # Đóng khung đỏ nổi bật theo đúng yêu cầu của bạn
+                box_mode="RED"
             )
 
         self.last_annotated_image = display_frame
@@ -360,18 +411,14 @@ class ALPRWebSystem:
         return crops_for_ocr
 
     def run_background_ocr_job(self, matched_key: str, crop: np.ndarray, det_conf: int, bbox: tuple):
-        """
-        Dùng toàn bộ sức mạnh của hàm self.ocr.extract_text(crop) để đọc chuẩn xác 100%
-        các biển số xe máy/ô tô trong video (kể cả nghiêng, mờ).
-        """
         try:
             with self.ocr_lock:
-                plate_text, traced_img, avg_conf = self.ocr.extract_text(crop)
+                plate_text, traced_img, avg_conf = self.ocr.extract_text(crop, orient="ROT0")
 
-            clean_alnum = "".join(filter(str.isalnum, plate_text))
-            if len(clean_alnum) < 7:
+            if not self.is_valid_vn_plate(plate_text, avg_conf):
                 return
 
+            clean_alnum = "".join(filter(str.isalnum, plate_text))
             now_ts = time.time()
             t_info = self.tracked_vehicles.get(matched_key)
             old_conf = t_info["conf"] if t_info else -1.0
@@ -571,6 +618,13 @@ STATUS_CONFIG = {
         "badge_cls": "bg-purple-600/30 text-purple-200 border border-purple-400/60 blink-alert",
         "card_cls": "dossier-alert",
         "dot_cls": "bg-purple-400"
+    },
+    "KHONG RO": {
+        "label": "KHÔNG ĐỌC RÕ",
+        "icon": "help_outline",
+        "badge_cls": "bg-slate-600/30 text-slate-300 border border-slate-500/40",
+        "card_cls": "dossier-unknown",
+        "dot_cls": "bg-slate-400"
     }
 }
 
@@ -656,6 +710,10 @@ def main_page():
                 border-left: 5px solid #f59e0b;
                 background: linear-gradient(105deg, rgba(245, 158, 11, 0.12) 0%, rgba(15, 23, 42, 0.92) 50%);
             }
+            .dossier-unknown {
+                border-left: 5px solid #64748b;
+                background: linear-gradient(105deg, rgba(100, 116, 139, 0.10) 0%, rgba(15, 23, 42, 0.92) 50%);
+            }
 
             .plate-3d {
                 background: linear-gradient(180deg, #ffffff 0%, #e2e8f0 100%);
@@ -699,7 +757,6 @@ def main_page():
         </style>
     ''')
 
-    # ================= CỬA SỔ MODAL CHI TIẾT =================
     with ui.dialog() as detail_dialog, ui.card().classes('cyber-glass w-[560px] max-w-[95vw] p-6 text-slate-100'):
         dialog_content = ui.column().classes('w-full gap-4')
 
@@ -733,7 +790,8 @@ def main_page():
             def refresh_status_selector():
                 status_buttons_row.clear()
                 with status_buttons_row:
-                    for st_key, st_info in STATUS_CONFIG.items():
+                    for st_key in ["HOP LE", "PHAT NGUOI", "HET HAN DANG KIEM", "XE TRUY NA"]:
+                        st_info = STATUS_CONFIG[st_key]
                         is_chosen = (selected_status["val"] == st_key)
                         btn_color = 'emerald' if st_key == 'HOP LE' else ('rose' if st_key == 'PHAT NGUOI' else (
                             'amber' if st_key == 'HET HAN DANG KIEM' else 'purple'))
@@ -754,6 +812,8 @@ def main_page():
                 alpr_system.update_vehicle_in_db(plate_str, selected_status["val"], owner_input.value.strip())
                 safe_notify(f'Đã cập nhật biển số {plate_str}!', 'positive')
                 detail_dialog.close()
+                if not alpr_system.video_running and alpr_system.latest_frame_b64:
+                    main_image.set_source(alpr_system.latest_frame_b64)
                 refresh_all_views()
 
             with ui.row().classes('w-full justify-end gap-3 mt-3 pt-3 border-t border-slate-800'):
@@ -763,7 +823,6 @@ def main_page():
 
         detail_dialog.open()
 
-    # ================= HEADER GỌN GÀNG, CHUYÊN NGHIỆP =================
     with ui.header(elevated=True).style('background: rgba(6, 9, 19, 0.88); backdrop-filter: blur(16px);').classes(
             'items-center justify-between px-6 py-3 border-b border-slate-800/80'):
         with ui.row().classes('items-center gap-3.5'):
@@ -882,9 +941,11 @@ def main_page():
                 main_image = ui.interactive_image().classes(
                     'w-full rounded-xl bg-slate-950/90 border border-slate-800/90 min-h-[420px] max-h-[510px] object-contain shadow-inner')
 
+                # ================= THANH THỜI GIAN & TỐC ĐỘ VIDEO  =================
                 video_controls_bar = ui.column().classes(
                     'w-full bg-slate-900/95 border border-slate-700/80 rounded-xl p-3 mt-3 gap-2')
                 video_controls_bar.set_visibility(False)
+
                 with video_controls_bar:
                     with ui.row().classes('w-full items-center gap-3 no-wrap'):
                         def toggle_pause_video():
@@ -893,7 +954,6 @@ def main_page():
 
                         pause_btn = ui.button(icon='pause', on_click=toggle_pause_video).props(
                             'unelevated color=cyan round dense')
-
                         time_label = ui.label('00:00 / 00:00').classes(
                             'text-xs font-bold text-cyan-300 mono-font min-w-[92px]')
 
@@ -928,9 +988,27 @@ def main_page():
                                     'text-xs font-bold px-2.5 py-0.5 mono-font')
                                 speed_buttons[s_opt] = btn_s
 
+                # ================= THANH TIẾN TRÌNH TẢI ẢNH & DÒ BIỂN SỐ (%) =================
+                progress_box = ui.column().classes(
+                    'w-full bg-slate-900/90 border border-cyan-500/30 rounded-xl p-3 mt-3 gap-1.5')
+                progress_box.set_visibility(False)
+                with progress_box:
+                    with ui.row().classes('w-full justify-between items-center'):
+                        progress_status_lbl = ui.label('Đang chuẩn bị...').classes('text-xs font-bold text-cyan-300')
+                        progress_pct_lbl = ui.label('0%').classes('text-xs font-black text-emerald-400 mono-font')
+                    upload_progress_bar = ui.linear_progress(value=0.0, show_value=False, color='cyan').classes(
+                        'h-2 rounded-full')
+
+                def set_upload_progress(pct: int, text: str):
+                    progress_box.set_visibility(True)
+                    upload_progress_bar.value = pct / 100.0
+                    progress_pct_lbl.set_text(f'{pct}%')
+                    progress_status_lbl.set_text(text)
+
                 async def handle_upload(e):
                     alpr_system.video_running = False
-                    await asyncio.sleep(0.12)
+                    set_upload_progress(15, 'Đang nhận tệp tải lên...')
+                    await asyncio.sleep(0.08)
 
                     filename = ""
                     if hasattr(e, 'name') and e.name:
@@ -941,6 +1019,7 @@ def main_page():
                         filename = str(e.file.filename)
 
                     temp_raw = TEMP_DIR / f"upload_raw_{int(time.time())}.bin"
+                    set_upload_progress(35, f'Đang lưu tệp {filename}...')
 
                     if hasattr(e, 'file') and hasattr(e.file, 'save'):
                         res_save = e.file.save(temp_raw)
@@ -975,20 +1054,28 @@ def main_page():
 
                     video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
                     if ext in video_extensions:
+                        set_upload_progress(100, 'Đã tải xong video — Đang phát và tự động nhận diện...')
                         video_controls_bar.set_visibility(True)
                         pause_btn.props('icon=pause')
                         safe_notify('Đang phát video (tốc độ 0.2x) và tự động nhận diện biển số...', 'positive')
                         alpr_system.start_video_thread(temp_file)
+                        await asyncio.sleep(1.2)
+                        progress_box.set_visibility(False)
                     else:
                         video_controls_bar.set_visibility(False)
-                        safe_notify('Đang phân tích biển số...', 'info')
+                        set_upload_progress(65, 'Đang dò tìm và đọc toàn bộ biển số trong ảnh...')
                         img, res = await run.io_bound(alpr_system.process_image, temp_file)
                         if img is not None:
                             main_image.set_source(alpr_system.latest_frame_b64)
                             alpr_system.frame_updated = False
                             ui_state["filter_mode"] = "ALL"
                             refresh_all_views()
+                            set_upload_progress(100, f'Hoàn tất! Đã phát hiện {len(res)} biển số.')
                             safe_notify(f'Đã nhận diện {len(res)} biển số!', 'positive')
+                        else:
+                            set_upload_progress(100, 'Không thể đọc tệp ảnh này.')
+                        await asyncio.sleep(1.5)
+                        progress_box.set_visibility(False)
 
                 upload_widget = ui.upload(
                     on_upload=handle_upload,
@@ -1033,7 +1120,7 @@ def main_page():
                         for item in alpr_system.history_logs:
                             if m == "VALID" and item["status"] != "HOP LE":
                                 continue
-                            if m == "VIOLATION" and item["status"] == "HOP LE":
+                            if m == "VIOLATION" and item["status"] in ("HOP LE", "KHONG RO"):
                                 continue
                             if q and (
                                     q not in item["plate"].upper() and q not in item["owner"].upper() and q not in item[
@@ -1050,7 +1137,7 @@ def main_page():
                         for log in filtered_logs:
                             st = log["status"]
                             st_cfg = STATUS_CONFIG.get(st, STATUS_CONFIG["HOP LE"])
-                            is_alert = (st != "HOP LE")
+                            is_alert = (st not in ("HOP LE", "KHONG RO"))
                             row_bg = "bg-rose-950/25 border-rose-500/30 hover:border-rose-400/60" if is_alert else "bg-slate-900/70 border-slate-800 hover:border-cyan-500/40"
 
                             with ui.row().classes(
@@ -1133,8 +1220,8 @@ def main_page():
 
                     visible_results = [
                         r for r in alpr_system.current_results
-                        if not (m == "VALID" and r["db"]["status"] != "HOP LE") and not (
-                                    m == "VIOLATION" and r["db"]["status"] == "HOP LE")
+                        if not (m == "VALID" and r["db"]["status"] != "HOP LE")
+                           and not (m == "VIOLATION" and r["db"]["status"] in ("HOP LE", "KHONG RO"))
                     ]
 
                     if not visible_results:
@@ -1148,8 +1235,9 @@ def main_page():
 
                     for res in visible_results:
                         st = res['db']['status']
-                        st_cfg = STATUS_CONFIG.get(st, STATUS_CONFIG["HOP LE"])
-                        is_alert = (st != "HOP LE")
+                        st_cfg = STATUS_CONFIG.get(st, STATUS_CONFIG["KHONG RO"])
+                        is_unknown = (st == "KHONG RO")
+                        is_alert = (st not in ("HOP LE", "KHONG RO"))
 
                         with ui.card().classes(f"cyber-glass {st_cfg['card_cls']} w-full p-5"):
                             with ui.row().classes(
@@ -1159,33 +1247,43 @@ def main_page():
                                     ui.label(f"XE #{res['id']} • {res['timestamp']}").classes(
                                         'text-xs text-slate-300 mono-font font-semibold')
 
-                                with ui.element('div').classes(
-                                        f"px-3 py-1 rounded-full text-xs font-extrabold flex items-center gap-1.5 status-chip {st_cfg['badge_cls']}"):
-                                    ui.icon(st_cfg["icon"], size='16px')
-                                    ui.label(st_cfg["label"])
-                                    ui.icon('expand_more', size='16px')
-                                    with ui.menu().props('dark auto-close'):
-                                        ui.menu_item('✅ Xác nhận: HỢP LỆ',
-                                                     on_click=lambda p=res["plate"]: quick_change_status(p, "HOP LE"))
-                                        ui.menu_item('🚨 Cảnh báo: PHẠT NGUỘI',
-                                                     on_click=lambda p=res["plate"]: quick_change_status(p,
-                                                                                                         "PHAT NGUOI"))
-                                        ui.menu_item('⚠️ Cảnh báo: HẾT HẠN ĐĂNG KIỂM',
-                                                     on_click=lambda p=res["plate"]: quick_change_status(p,
-                                                                                                         "HET HAN DANG KIEM"))
-                                        ui.menu_item('🚓 Khẩn cấp: XE TRUY NÃ',
-                                                     on_click=lambda p=res["plate"]: quick_change_status(p,
-                                                                                                         "XE TRUY NA"))
+                                if is_unknown:
+                                    with ui.element('div').classes(
+                                            f"px-3 py-1 rounded-full text-xs font-extrabold flex items-center gap-1.5 {st_cfg['badge_cls']}"):
+                                        ui.icon(st_cfg["icon"], size='16px')
+                                        ui.label(st_cfg["label"])
+                                else:
+                                    with ui.element('div').classes(
+                                            f"px-3 py-1 rounded-full text-xs font-extrabold flex items-center gap-1.5 status-chip {st_cfg['badge_cls']}"):
+                                        ui.icon(st_cfg["icon"], size='16px')
+                                        ui.label(st_cfg["label"])
+                                        ui.icon('expand_more', size='16px')
+                                        with ui.menu().props('dark auto-close'):
+                                            ui.menu_item('✅ Xác nhận: HỢP LỆ',
+                                                         on_click=lambda p=res["plate"]: quick_change_status(p,
+                                                                                                             "HOP LE"))
+                                            ui.menu_item('🚨 Cảnh báo: PHẠT NGUỘI',
+                                                         on_click=lambda p=res["plate"]: quick_change_status(p,
+                                                                                                             "PHAT NGUOI"))
+                                            ui.menu_item('⚠️ Cảnh báo: HẾT HẠN ĐĂNG KIỂM',
+                                                         on_click=lambda p=res["plate"]: quick_change_status(p,
+                                                                                                             "HET HAN DANG KIEM"))
+                                            ui.menu_item('🚓 Khẩn cấp: XE TRUY NÃ',
+                                                         on_click=lambda p=res["plate"]: quick_change_status(p,
+                                                                                                             "XE TRUY NA"))
 
                             with ui.row().classes('w-full gap-4 items-center mb-4 no-wrap'):
                                 if res['xray'] is not None:
-                                    with ui.column().classes(
-                                            'w-5/12 bg-slate-950 p-2 rounded-xl border border-slate-700/80 items-center shadow-inner cursor-pointer').on(
+                                    crop_box = ui.column().classes(
+                                        'w-5/12 bg-slate-950 p-2 rounded-xl border border-slate-700/80 items-center shadow-inner')
+                                    if not is_unknown:
+                                        crop_box.classes(add='cursor-pointer').on(
                                             'click',
                                             lambda r=res: open_vehicle_modal(r["plate"], r["db"]["owner"],
                                                                              r["db"]["reg_date"], r["db"]["status"],
                                                                              r["province"], r["xray"], r["conf"])
-                                    ):
+                                        )
+                                    with crop_box:
                                         ui.image(cv2_to_base64(res['xray'])).classes(
                                             'w-full h-24 object-contain rounded')
                                         ui.label('ẢNH CẮT BIỂN SỐ').classes(
@@ -1226,42 +1324,44 @@ def main_page():
                                         'text-sm font-bold text-slate-200 mono-font')
                                 with ui.column().classes('gap-0'):
                                     ui.label('TRẠNG THÁI').classes('text-[10px] font-bold text-slate-400')
-                                    status_text_color = "text-rose-400" if is_alert else "text-emerald-400"
+                                    status_text_color = "text-slate-400" if is_unknown else (
+                                        "text-rose-400" if is_alert else "text-emerald-400")
                                     ui.label(f"● {st_cfg['label']}").classes(f'text-sm font-black {status_text_color}')
 
-                            with ui.row().classes(
-                                    'w-full justify-between items-center mt-3 pt-2.5 border-t border-slate-800/80'):
-                                with ui.row().classes('gap-1.5'):
-                                    if is_alert:
+                            if not is_unknown:
+                                with ui.row().classes(
+                                        'w-full justify-between items-center mt-3 pt-2.5 border-t border-slate-800/80'):
+                                    with ui.row().classes('gap-1.5'):
+                                        if is_alert:
+                                            ui.button(
+                                                'Xác nhận Hợp lệ',
+                                                icon='check_circle',
+                                                on_click=lambda p=res["plate"]: quick_change_status(p, "HOP LE")
+                                            ).props('dense unelevated color=emerald').classes(
+                                                'text-[11px] font-bold px-2.5 py-1 rounded-lg')
+                                        else:
+                                            ui.button(
+                                                'Báo Phạt nguội',
+                                                icon='gavel',
+                                                on_click=lambda p=res["plate"]: quick_change_status(p, "PHAT NGUOI")
+                                            ).props('dense outline color=rose').classes(
+                                                'text-[11px] font-bold px-2.5 py-1 rounded-lg')
+
                                         ui.button(
-                                            'Xác nhận Hợp lệ',
-                                            icon='check_circle',
-                                            on_click=lambda p=res["plate"]: quick_change_status(p, "HOP LE")
-                                        ).props('dense unelevated color=emerald').classes(
-                                            'text-[11px] font-bold px-2.5 py-1 rounded-lg')
-                                    else:
-                                        ui.button(
-                                            'Báo Phạt nguội',
-                                            icon='gavel',
-                                            on_click=lambda p=res["plate"]: quick_change_status(p, "PHAT NGUOI")
-                                        ).props('dense outline color=rose').classes(
+                                            'Hết hạn ĐK',
+                                            icon='event_busy',
+                                            on_click=lambda p=res["plate"]: quick_change_status(p, "HET HAN DANG KIEM")
+                                        ).props('dense outline color=amber').classes(
                                             'text-[11px] font-bold px-2.5 py-1 rounded-lg')
 
                                     ui.button(
-                                        'Hết hạn ĐK',
-                                        icon='event_busy',
-                                        on_click=lambda p=res["plate"]: quick_change_status(p, "HET HAN DANG KIEM")
-                                    ).props('dense outline color=amber').classes(
-                                        'text-[11px] font-bold px-2.5 py-1 rounded-lg')
-
-                                ui.button(
-                                    'Chi tiết / Sửa',
-                                    icon='edit_note',
-                                    on_click=lambda r=res: open_vehicle_modal(
-                                        r["plate"], r["db"]["owner"], r["db"]["reg_date"], r["db"]["status"],
-                                        r["province"], r["xray"], r["conf"]
-                                    )
-                                ).props('dense flat color=cyan').classes('text-xs font-bold')
+                                        'Chi tiết / Sửa',
+                                        icon='edit_note',
+                                        on_click=lambda r=res: open_vehicle_modal(
+                                            r["plate"], r["db"]["owner"], r["db"]["reg_date"], r["db"]["status"],
+                                            r["province"], r["xray"], r["conf"]
+                                        )
+                                    ).props('dense flat color=cyan').classes('text-xs font-bold')
 
     def refresh_all_views():
         try:
@@ -1274,9 +1374,9 @@ def main_page():
     def sync_ui_loop():
         if alpr_system.frame_updated and alpr_system.latest_frame_b64:
             alpr_system.frame_updated = False
-            main_image.set_source(alpr_system.latest_frame_b64)
+            (main_image
+             .set_source(alpr_system.latest_frame_b64))
 
-        # Cập nhật thanh thời gian (Timeline) khi đang ở chế độ Video
         if alpr_system.is_video_mode and alpr_system.video_total_frames > 0:
             cur_f = alpr_system.video_current_frame
             tot_f = alpr_system.video_total_frames
@@ -1300,5 +1400,5 @@ def main_page():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    open_port = native.find_open_port(start_port=8083)
+    open_port = native.find_open_port(start_port=8080)
     ui.run(title="Trung Tâm Giám Sát & Nhận Diện Biển Số", port=open_port, reload=False)
